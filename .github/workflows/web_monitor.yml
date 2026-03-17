@@ -1,0 +1,56 @@
+name: Web Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # every 15 minutes
+  workflow_dispatch:          # manual trigger from GitHub UI
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      # Restore the state file from the previous run.
+      # restore-keys allows a prefix match so the latest saved cache is found
+      # even though each run saves under a unique key (github.run_id).
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: web_monitor_state.json
+          key: web-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            web-monitor-state-
+
+      - name: Run monitor (once)
+        env:
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          python src/web_monitor.py \
+            --url "${{ secrets.MONITOR_URL }}" \
+            --selector "${{ vars.MONITOR_SELECTOR }}" \
+            --smtp-host "${{ vars.SMTP_HOST }}" \
+            --smtp-user "${{ vars.SMTP_USER }}" \
+            --email-from "${{ vars.EMAIL_FROM }}" \
+            --email-to "${{ secrets.EMAIL_TO }}" \
+            --once \
+            --state-file web_monitor_state.json
+
+      # Save the updated state file under a unique key so the next run
+      # can restore it via the restore-keys prefix above.
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: web_monitor_state.json
+          key: web-monitor-state-${{ github.run_id }}

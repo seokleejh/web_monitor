@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+web_monitor_state.json
+snapshots/
+.pytest_cache/
