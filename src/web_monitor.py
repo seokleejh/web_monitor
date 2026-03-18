@@ -49,11 +49,28 @@ log = logging.getLogger("web_monitor")
 # 핵심 함수들
 # ════════════════════════════════════════════════════════════
 
-def fetch_content(url: str, selector: Optional[str], timeout: int, headers: dict) -> Optional[str]:
+def load_cookies(cookies_file: str) -> dict:
+    """JSON 쿠키 파일(EditThisCookie / Cookie-Editor 형식)을 dict로 변환합니다."""
+    with open(cookies_file, encoding="utf-8") as f:
+        raw = json.load(f)
+    # EditThisCookie: list of {name, value, ...}
+    # Cookie-Editor:  list of {name, value, ...}  (같은 구조)
+    return {c["name"]: c["value"] for c in raw}
+
+
+def fetch_content(url: str, selector: Optional[str], timeout: int, headers: dict,
+                  cookies: Optional[dict] = None) -> Optional[str]:
     """URL을 가져와 텍스트(또는 선택자 일치 부분)를 반환합니다."""
     try:
-        resp = requests.get(url, timeout=timeout, headers=headers)
+        session = requests.Session()
+        session.headers.update(headers)
+        if cookies:
+            session.cookies.update(cookies)
+        resp = session.get(url, timeout=timeout)
         resp.raise_for_status()
+        # 로그인 페이지로 리다이렉트됐는지 간단히 감지
+        if cookies and resp.url != url and "login" in resp.url.lower():
+            log.warning("로그인 페이지로 리다이렉트됨. 쿠키가 만료됐을 수 있습니다: %s", resp.url)
         soup = BeautifulSoup(resp.text, "html.parser")
 
         if selector:
@@ -188,6 +205,7 @@ class WebMonitor:
         save_snapshots: bool = True,
         headers: Optional[dict] = None,
         alert_title: str = "웹페이지 변경 감지!",
+        cookies_file: Optional[str] = None,
         smtp_host: Optional[str] = None,
         smtp_port: int = 587,
         smtp_user: Optional[str] = None,
@@ -203,6 +221,13 @@ class WebMonitor:
         self.save_snapshots = save_snapshots
         self.headers = headers or self.DEFAULT_HEADERS
         self.alert_title = alert_title
+        self.cookies: Optional[dict] = None
+        if cookies_file:
+            try:
+                self.cookies = load_cookies(cookies_file)
+                log.info("쿠키 로드 완료: %s (%d개)", cookies_file, len(self.cookies))
+            except Exception as e:
+                log.error("쿠키 파일 로드 실패: %s", e)
         self.smtp_host = smtp_host
         self.smtp_port = smtp_port
         self.smtp_user = smtp_user
@@ -230,7 +255,7 @@ class WebMonitor:
             self._check_count += 1
             log.info("[%d회차] 확인 중...", self._check_count)
 
-            content = fetch_content(self.url, self.selector, self.timeout, self.headers)
+            content = fetch_content(self.url, self.selector, self.timeout, self.headers, self.cookies)
             if content is None:
                 log.warning("콘텐츠를 가져오지 못했습니다. %d초 후 재시도.", self.interval)
                 time.sleep(self.interval)
@@ -277,7 +302,7 @@ class WebMonitor:
         state = load_state(state_file)
         prev_hash = state.get("hash")
 
-        content = fetch_content(self.url, self.selector, self.timeout, self.headers)
+        content = fetch_content(self.url, self.selector, self.timeout, self.headers, self.cookies)
         if content is None:
             log.error("콘텐츠를 가져오지 못했습니다. 종료.")
             sys.exit(1)
@@ -349,6 +374,7 @@ def main():
     parser.add_argument("--email-from", default=os.environ.get("EMAIL_FROM"), help="발신 이메일 주소")
     parser.add_argument("--email-to", default=os.environ.get("EMAIL_TO"), help="수신 이메일 주소")
     parser.add_argument("--no-tls", action="store_true", help="TLS 비활성화")
+    parser.add_argument("--cookies", help="쿠키 JSON 파일 경로 (로그인 필요 페이지용)")
     # GitHub Actions / cron 모드
     parser.add_argument("--once", action="store_true", help="한 번만 실행 (GitHub Actions 등 cron 환경용)")
     parser.add_argument("--state-file", default="web_monitor_state.json", help="run_once 상태 파일 경로")
@@ -378,6 +404,7 @@ def main():
     cfg.setdefault("email_from", args.email_from)
     cfg.setdefault("email_to", args.email_to)
     cfg.setdefault("use_tls", not args.no_tls)
+    cfg.setdefault("cookies_file", args.cookies)
 
     monitor = WebMonitor(**cfg)
     try:
