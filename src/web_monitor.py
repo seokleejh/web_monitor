@@ -8,6 +8,7 @@ web_monitor.py - 웹페이지 변경 감지 & 알림 프로그램
 
 필수 패키지 설치:
   pip install requests beautifulsoup4 plyer
+  pip install twilio  # SMS 알림 사용 시
 """
 
 import hashlib
@@ -31,6 +32,13 @@ try:
     PLYER_AVAILABLE = True
 except ImportError:
     PLYER_AVAILABLE = False
+
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TwilioClient = None  # type: ignore[assignment,misc]
+    TWILIO_AVAILABLE = False
 
 # ── 로깅 설정 ────────────────────────────────────────────────
 logging.basicConfig(
@@ -154,6 +162,27 @@ def send_email_notification(
         return False
 
 
+def send_sms_notification(
+    body: str,
+    twilio_account_sid: str,
+    twilio_auth_token: str,
+    sms_from: str,
+    sms_to: str,
+) -> bool:
+    """Twilio를 이용한 SMS 알림 전송."""
+    if not TWILIO_AVAILABLE:
+        log.error("twilio 패키지가 설치되어 있지 않습니다. 'pip install twilio' 로 설치하세요.")
+        return False
+    try:
+        client = TwilioClient(twilio_account_sid, twilio_auth_token)
+        client.messages.create(body=body, from_=sms_from, to=sms_to)
+        log.info("SMS 발송 완료 → %s", sms_to)
+        return True
+    except Exception as e:
+        log.error("SMS 발송 실패: %s", e)
+        return False
+
+
 def load_state(state_file: str) -> dict:
     """상태 파일에서 이전 해시를 불러옵니다."""
     if not os.path.exists(state_file):
@@ -213,6 +242,10 @@ class WebMonitor:
         email_from: Optional[str] = None,
         email_to: Optional[str] = None,
         use_tls: bool = True,
+        twilio_account_sid: Optional[str] = None,
+        twilio_auth_token: Optional[str] = None,
+        sms_from: Optional[str] = None,
+        sms_to: Optional[str] = None,
     ):
         self.url = url
         self.interval = interval
@@ -235,6 +268,10 @@ class WebMonitor:
         self.email_from = email_from
         self.email_to = email_to
         self.use_tls = use_tls
+        self.twilio_account_sid = twilio_account_sid
+        self.twilio_auth_token = twilio_auth_token
+        self.sms_from = sms_from
+        self.sms_to = sms_to
         self._prev_hash: Optional[str] = None
         self._check_count = 0
 
@@ -243,13 +280,31 @@ class WebMonitor:
         return all([self.smtp_host, self.smtp_user, self.smtp_password,
                     self.email_from, self.email_to])
 
-    def run(self):
+    @property
+    def _sms_configured(self) -> bool:
+        return all([self.twilio_account_sid, self.twilio_auth_token,
+                    self.sms_from, self.sms_to])
+
+    def _log_summary(self):
         log.info("=" * 60)
         log.info("모니터링 시작")
         log.info("  URL      : %s", self.url)
         log.info("  선택자   : %s", self.selector or "(전체 body)")
         log.info("  간격     : %d 초", self.interval)
+        log.info("  쿠키     : %s", "사용" if self.cookies else "없음")
+        log.info("── 알림 수신자 ──────────────────────────────")
+        if self._email_configured:
+            log.info("  이메일   : %s", self.email_to)
+        else:
+            log.info("  이메일   : (미설정)")
+        if self._sms_configured:
+            log.info("  SMS      : %s", self.sms_to)
+        else:
+            log.info("  SMS      : (미설정)")
         log.info("=" * 60)
+
+    def run(self):
+        self._log_summary()
 
         while True:
             self._check_count += 1
@@ -258,6 +313,33 @@ class WebMonitor:
             content = fetch_content(self.url, self.selector, self.timeout, self.headers, self.cookies)
             if content is None:
                 log.warning("콘텐츠를 가져오지 못했습니다. %d초 후 재시도.", self.interval)
+                if self._prev_hash is not None:
+                    msg = f"콘텐츠 감지 실패 — 페이지가 변경됐을 수 있습니다 ({datetime.now().strftime('%H:%M:%S')})\n{self.url}"
+                    send_notification(self.alert_title, msg, self.url)
+                    if self._email_configured:
+                        assert self.smtp_host and self.smtp_user and self.smtp_password
+                        assert self.email_from and self.email_to
+                        send_email_notification(
+                            subject=self.alert_title,
+                            body=msg,
+                            smtp_host=self.smtp_host,
+                            smtp_port=self.smtp_port,
+                            smtp_user=self.smtp_user,
+                            smtp_password=self.smtp_password,
+                            email_from=self.email_from,
+                            email_to=self.email_to,
+                            use_tls=self.use_tls,
+                        )
+                    if self._sms_configured:
+                        assert self.twilio_account_sid and self.twilio_auth_token
+                        assert self.sms_from and self.sms_to
+                        send_sms_notification(
+                            body=f"{self.alert_title}: {msg}",
+                            twilio_account_sid=self.twilio_account_sid,
+                            twilio_auth_token=self.twilio_auth_token,
+                            sms_from=self.sms_from,
+                            sms_to=self.sms_to,
+                        )
                 time.sleep(self.interval)
                 continue
 
@@ -285,6 +367,16 @@ class WebMonitor:
                         email_to=self.email_to,
                         use_tls=self.use_tls,
                     )
+                if self._sms_configured:
+                    assert self.twilio_account_sid and self.twilio_auth_token
+                    assert self.sms_from and self.sms_to
+                    send_sms_notification(
+                        body=f"{self.alert_title}: {msg}",
+                        twilio_account_sid=self.twilio_account_sid,
+                        twilio_auth_token=self.twilio_auth_token,
+                        sms_from=self.sms_from,
+                        sms_to=self.sms_to,
+                    )
                 log.warning("★ 변경 감지! 해시: %s → %s", self._prev_hash[:8], current_hash[:8])
 
                 if self.save_snapshots:
@@ -304,7 +396,34 @@ class WebMonitor:
 
         content = fetch_content(self.url, self.selector, self.timeout, self.headers, self.cookies)
         if content is None:
-            log.error("콘텐츠를 가져오지 못했습니다. 종료.")
+            log.error("콘텐츠를 가져오지 못했습니다.")
+            if prev_hash is not None:
+                msg = f"콘텐츠 감지 실패 — 페이지가 변경됐을 수 있습니다 ({datetime.now().strftime('%H:%M:%S')})\n{self.url}"
+                send_notification(self.alert_title, msg, self.url)
+                if self._email_configured:
+                    assert self.smtp_host and self.smtp_user and self.smtp_password
+                    assert self.email_from and self.email_to
+                    send_email_notification(
+                        subject=self.alert_title,
+                        body=msg,
+                        smtp_host=self.smtp_host,
+                        smtp_port=self.smtp_port,
+                        smtp_user=self.smtp_user,
+                        smtp_password=self.smtp_password,
+                        email_from=self.email_from,
+                        email_to=self.email_to,
+                        use_tls=self.use_tls,
+                    )
+                if self._sms_configured:
+                    assert self.twilio_account_sid and self.twilio_auth_token
+                    assert self.sms_from and self.sms_to
+                    send_sms_notification(
+                        body=f"{self.alert_title}: {msg}",
+                        twilio_account_sid=self.twilio_account_sid,
+                        twilio_auth_token=self.twilio_auth_token,
+                        sms_from=self.sms_from,
+                        sms_to=self.sms_to,
+                    )
             sys.exit(1)
 
         current_hash = compute_hash(content)
@@ -328,6 +447,16 @@ class WebMonitor:
                     email_from=self.email_from,
                     email_to=self.email_to,
                     use_tls=self.use_tls,
+                )
+            if self._sms_configured:
+                assert self.twilio_account_sid and self.twilio_auth_token
+                assert self.sms_from and self.sms_to
+                send_sms_notification(
+                    body=f"{self.alert_title}: {msg}",
+                    twilio_account_sid=self.twilio_account_sid,
+                    twilio_auth_token=self.twilio_auth_token,
+                    sms_from=self.sms_from,
+                    sms_to=self.sms_to,
                 )
             if self.save_snapshots:
                 save_snapshot(content, self.url)
@@ -375,6 +504,10 @@ def main():
     parser.add_argument("--email-to", default=os.environ.get("EMAIL_TO"), help="수신 이메일 주소")
     parser.add_argument("--no-tls", action="store_true", help="TLS 비활성화")
     parser.add_argument("--cookies", help="쿠키 JSON 파일 경로 (로그인 필요 페이지용)")
+    # SMS 설정 (Twilio) — 인증 토큰은 환경변수 TWILIO_AUTH_TOKEN 에서만 읽음
+    parser.add_argument("--twilio-account-sid", default=os.environ.get("TWILIO_ACCOUNT_SID"), help="Twilio Account SID")
+    parser.add_argument("--sms-from", default=os.environ.get("SMS_FROM"), help="발신 전화번호 (Twilio 번호, 예: +12025551234)")
+    parser.add_argument("--sms-to", default=os.environ.get("SMS_TO"), help="수신 전화번호 (예: +821012345678)")
     # GitHub Actions / cron 모드
     parser.add_argument("--once", action="store_true", help="한 번만 실행 (GitHub Actions 등 cron 환경용)")
     parser.add_argument("--state-file", default="web_monitor_state.json", help="run_once 상태 파일 경로")
@@ -405,6 +538,11 @@ def main():
     cfg.setdefault("email_to", args.email_to)
     cfg.setdefault("use_tls", not args.no_tls)
     cfg.setdefault("cookies_file", args.cookies)
+    # SMS 설정 병합
+    cfg.setdefault("twilio_account_sid", args.twilio_account_sid)
+    cfg.setdefault("twilio_auth_token", os.environ.get("TWILIO_AUTH_TOKEN"))
+    cfg.setdefault("sms_from", args.sms_from)
+    cfg.setdefault("sms_to", args.sms_to)
 
     monitor = WebMonitor(**cfg)
     try:
